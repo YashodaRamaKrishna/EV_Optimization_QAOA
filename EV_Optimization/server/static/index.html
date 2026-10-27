@@ -1,0 +1,514 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EV Coupled Optimization</title><link rel="stylesheet" href="styles.css?v=3"></head><body>
+<header><div><h1>Quantum Optimization of Coupled EV Charger Siting &amp; Scheduling</h1><p>Grid-aware optimization of station placement and EV charging schedules</p></div><div class="badges"><span class="live">● Local Engine</span><span>Primary: Simulated Annealing (SA)</span><span>Exact Enumeration (Validation)</span><span>QAOA (Qiskit Aer)</span><span>QUBO</span></div></header>
+<nav id="tabs"><button class="active" data-tab="setup">1. Problem Setup</button><button data-tab="model">2. Model</button><button data-tab="solve">3. Solve</button><button data-tab="result" disabled>4. Results</button><button data-tab="scaling">5. Scaling &amp; IBM Hardware</button><button data-tab="estimate">6. Estimate Resources</button></nav>
+<main>
+<section id="setup" class="panel active"><div class="section-title"><div><h2>Problem setup</h2><p>Define one coupled station-siting and charging-scheduling instance.</p></div><span class="tag">Problem Configuration</span></div>
+<div class="card controls"><label>Preset<select id="preset"></select></label><label>Detour / travel cost <input id="detourWeight" type="number" value="1" min="0" step=".1"></label><label>Grid stress weight <input id="stress" type="number" value="0.25" min="0" step=".05"></label><label>Random seed <input id="seed" type="number" value="42"></label><div class="actions"><button id="addProblemBtn" class="primary" type="button">Add Problem</button><button id="deleteProblemBtn" class="secondary" type="button" disabled title="Built-in presets cannot be deleted">Delete Problem</button><button id="toModel" class="build-btn" type="button">Build Model</button><button id="baselineBtn" type="button">Load Baseline</button><button id="resetBtn" class="secondary" type="button">Reset</button></div></div>
+<div class="summary"><div><b id="evCount">3</b><span>EVs</span></div><div><b id="stationCount">2</b><span>Stations</span></div><div><b id="slotCount">4</b><span>Time slots</span></div><div><b id="qubits">22</b><span>Actual QUBO variables</span></div><div class="ready"><b>●</b><span>Problem ready</span></div></div>
+<article id="customBuilder" class="card custom-builder" hidden><div class="section-title"><div><h3>Define Custom Problem Instance</h3><p>Configure problem dimensions (Hard limits: max 8 EVs × 5 stations × 8 slots), charging demands, time windows, and detour costs.</p></div><span class="tag">Custom Problem</span></div><div class="controls"><label>EVs <span class="dim-limit">max 8</span><input id="customEVs" type="number" min="1" value="3"></label><label>Stations <span class="dim-limit">max 5</span><input id="customStations" type="number" min="1" value="2"></label><label>Time slots <span class="dim-limit">max 8</span><input id="customSlots" type="number" min="1" value="4"></label><button id="createProblemBtn" type="button">Update Form</button></div><div id="customForms"></div><div id="customErrors" class="validation" aria-live="polite"></div><div class="actions custom-actions"><button id="saveCustomBtn" type="button" class="primary" disabled>Save Problem</button><button id="cancelCustomBtn" type="button" class="secondary">Cancel</button><button id="buildCustomBtn" type="button" style="display:none;" disabled>Build Model</button><button id="estimateHandoffBtn" type="button" class="secondary" disabled title="Available when the problem exceeds live execution limits.">Estimate Resources</button><span class="muted">Saving creates a unique problem ID, persists it across restarts, and selects it for model building.</span></div></article>
+<div class="grid two"><article class="card"><h3>EV charging requirements</h3><div id="evTable"></div><small>Allowed charging windows shape the exact number of decision variables.</small></article><article class="card"><h3>Candidate stations</h3><div id="stationTable"></div><small>Opening and capacity are coupled to charging assignments.</small></article></div>
+<article class="card"><h3>Grid profile</h3><div id="gridTable"></div><p class="muted">Grid capacity and electricity price are specified per time slot.</p></article></section>
+<section id="model" class="panel"><div class="section-title"><div><h2>Coupled optimization model</h2><p>Placement shapes scheduling. Scheduling shapes placement.</p></div><span class="tag">QUBO Pipeline</span></div>
+<div class="grid two"><article class="card"><h3>Decision variables</h3><p><code>y<sub>s</sub></code> = 1 if station <em>s</em> is opened; otherwise 0.</p><p><code>x<sub>e,s,t</sub></code> = 1 if EV <em>e</em> charges at station <em>s</em> during time <em>t</em>; otherwise 0.</p><p class="metric"><b id="modelVarsCount">22</b> actual binary QUBO variables.</p><p class="muted" id="modelProblemDesc">Formula: N<sub>qubo</sub> = n<sub>st</sub> + Σ<sub>e</sub> (n<sub>st</sub> × |W<sub>e</sub>|)</p></article><article class="card"><h3>Objective</h3><div class="equation">Total objective = Electricity cost + Detour / travel cost + Infrastructure cost + Grid stress penalty</div><details><summary>Mathematical formulation</summary><p><code>min Σ priceₜxₑₛₜ + Σ detourₑₛxₑₛₜ + Σ open_costₛyₛ + stress(loadₜ)</code></p></details></article></div><div class="constraints"><article><b>Charging demand</b><span>Each EV receives its required charging.</span></article><article><b>Time window</b><span>EVs charge only in allowed slots.</span></article><article><b>Station capacity</b><span>No station serves too many EVs at once.</span></article><article><b>Grid capacity</b><span>Total load stays within each grid limit.</span></article><article><b>Coupling</b><span>Opening a station determines which charging assignments are possible.</span></article></div>
+<article class="card qubo"><h3>QUBO transformation</h3><p>Constraints are converted into penalty terms and incorporated into a QUBO.</p><code>min zᵀQz + c = objective + λ · constraint penalties</code><div class="pipeline-flow"><b>Problem</b><span>↓</span><b>Objective + Constraints</b><span>↓</span><b>QUBO</b><span>↓</span><b>Ising</b><span>↓</span><b>Cost Hamiltonian</b><span>↓</span><b>QAOA</b></div><small>QUBO is the common optimization formulation; classical and quantum methods evaluate this same formulation.</small></article>
+<article class="card qubo"><h3>Hamiltonian transformation</h3><p>Ising transformation: Binary variables are mapped to Pauli-Z spin operators to construct the problem Cost Hamiltonian:</p><code>x_i = (1-Z_i)/2</code><div class="pipeline-flow"><b>QUBO</b><span>↓</span><b>Ising representation</b><span>↓</span><b>Cost Hamiltonian</b><span>↓</span><b>QAOA / Quantum optimization</b></div><p class="muted"><code>QUBO → Ising representation → Cost Hamiltonian</code> &nbsp;·&nbsp; <code>Cost Hamiltonian → QAOA</code></p><small>Conceptual quantum mapping workflow. Parameterized QAOA ansatz circuits explore this Cost Hamiltonian on Qiskit Aer.</small></article>
+<article class="card model-action-card" style="margin-top:18px;display:flex;justify-content:space-between;align-items:center;padding:16px 20px;"><div><h3 style="margin:0 0 4px;">Ready to Optimize</h3><p class="muted" style="margin:0;">Model formulation compiled. Proceed to configure solvers and evaluate on the unified QUBO formulation.</p></div><button id="modelToSolveBtn" class="primary" type="button" style="font-size:15px;padding:10px 22px;">Solve →</button></article></section>
+<section id="solve" class="panel"><div class="section-title"><div><h2>Run optimization</h2><p>Select one or multiple solvers to evaluate on the SAME binary QUBO formulation.</p></div><span class="tag">Optimization Solvers</span></div>
+<div class="solver-grid">
+  <div class="solver-card selected" id="card-sa" data-solver="sa">
+    <div class="solver-head">
+      <label><input type="checkbox" id="chk-sa" checked> <b>Simulated Annealing (SA)</b></label>
+      <span class="badge badge-success" id="badge-sa">✓ Supported</span>
+    </div>
+    <p>Primary classical solver operating directly on binary QUBO. Configurable iterations, cooling schedule, and restarts.</p>
+    <small class="muted">Primary Classical Baseline</small>
+  </div>
+  <div class="solver-card" id="card-qaoa" data-solver="qaoa">
+    <div class="solver-head">
+      <label><input type="checkbox" id="chk-qaoa"> <b>Quantum / Hybrid QAOA</b></label>
+      <span class="badge badge-warn" id="badge-qaoa">Aer Simulator</span>
+    </div>
+    <p>QAOA parameterized ansatz circuit simulation via Qiskit Aer on the SAME QUBO formulation.</p>
+    <small class="muted">Aer Simulation Limit: 24 Logical Qubits</small>
+  </div>
+  <div class="solver-card" id="card-exact" data-solver="exact">
+    <div class="solver-head">
+      <label><input type="checkbox" id="chk-exact"> <b>Exact Enumeration</b></label>
+      <span class="badge badge-warn" id="badge-exact">Validation Only</span>
+    </div>
+    <p>Validates QUBO formulation and determines ground truth optimum for small instances.</p>
+    <small class="muted">Validation Limit: N ≤ 20 Qubits</small>
+  </div>
+</div>
+<article class="card">
+  <div class="section-title">
+    <div>
+      <h3 id="controlTitle">Solver Configuration &amp; Parameters</h3>
+      <p id="solverStatusSub">Configure parameters for selected solver(s).</p>
+    </div>
+  </div>
+  <div id="solverControls" class="solver-controls-area"></div>
+  <button id="runBtn" class="run">Run Optimization</button>
+  <div id="job" class="job">Status: <b>Ready</b><span> Select solver(s), configure parameters, and run the optimization pipeline.</span></div>
+</article></section>
+<section id="result" class="panel">
+<div class="section-title"><div><h2>Optimization Results</h2><p id="resultMeta">Baseline reference</p></div><button id="exportBtn" class="secondary">Export JSON</button></div>
+<div id="resultNotice"></div>
+<div class="single-solver-header-card summary results" id="summaryTiles">
+  <div class="single-solver-item"><span class="label">Solver</span><b id="resSolverName" class="val">SA</b></div>
+  <div class="single-solver-item"><span class="label">Objective</span><b id="resObjective" class="val">10.10</b></div>
+  <div class="single-solver-item"><span class="label">Feasibility</span><b id="resFeasible" class="val green">✓ FEASIBLE</b></div>
+  <div class="single-solver-item"><span class="label">Runtime</span><b id="resRuntime" class="val">0.040s</b></div>
+  <div class="single-solver-item"><span class="label">Stations Open</span><b id="resStationsOpen" class="val">2 / 2</b></div>
+  <div class="single-solver-item"><span class="label">Grid Stress</span><b id="resGridStress" class="val">1.50</b></div>
+  <div class="single-solver-item"><span class="label">Optimality Gap</span><b id="resGap" class="val">0.0%</b></div>
+  <div class="single-solver-item" style="display:none;"><span class="label">Total Cost</span><b id="resTotalCost" class="val">10.10</b></div>
+</div>
+<article class="card" id="multiStationPlacementCard" style="display:none;margin-bottom:18px;">
+  <div class="section-title">
+    <div>
+      <h3>Station Placement by Solver</h3>
+      <p class="muted">Candidate station opening decisions and feasibility across evaluated solvers.</p>
+    </div>
+    <div id="multiFeasibilityPills" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+  </div>
+  <div id="multiStationPlacementTable"></div>
+</article>
+<div class="grid two" id="singleSolutionGrid">
+  <article class="card"><h3>Station Placement</h3><div id="stationsList"></div><div id="validationBox" class="checks"></div></article>
+  <article class="card" id="singleScheduleCard"><h3>EV Charging Schedule</h3><div id="schedule"></div></article>
+</div>
+<article class="card" id="multiSchedulesCard" style="display:none;margin-top:18px;">
+  <h3>Decoded Charging Schedules by Solver</h3>
+  <p class="muted">Actual charging schedules decoded from each solver's best binary solution on the SAME QUBO.</p>
+  <div id="multiSchedulesContainer" class="schedule-multi"></div>
+</article>
+<div class="grid two">
+  <article class="card">
+    <h3>Grid Performance</h3>
+    <div id="loadChart" class="chart"></div>
+    <div id="loadLegend" class="legend"><i class="actual"></i> Actual load <i class="capacity"></i> Grid capacity</div>
+    <div id="gridMetrics" class="grid-metrics"></div>
+    <div id="gridProfileTable" style="margin-top:14px;"></div>
+  </article>
+  <article class="card">
+    <h3>Cost Breakdown</h3>
+    <div id="costChart" class="costs"></div>
+    <p id="costSummary"><b>Total: 10.10</b></p>
+  </article>
+</div>
+<article class="card" id="quantumResourcesCard" style="display:none;margin-top:18px;">
+  <div class="section-title"><div><h3>Quantum Resource Analysis</h3><p id="quantumResourceSubtitle">Measured circuit metrics from Qiskit Aer QAOA execution</p></div><span class="tag" id="quantumTag">Qiskit Aer QAOA</span></div>
+  <div id="quantumResourceContent"></div>
+</article>
+<article class="card" id="resultComparison" style="display:none;margin-top:18px;">
+  <div class="section-title"><div><h3>Multi-Solver Comparison</h3><p>All methods evaluated against the exact same QUBO formulation and ground truth.</p></div><span class="tag">Experimental Comparison</span></div>
+  <div id="resultCompareTable"></div>
+  <div class="grid two" style="margin-top:18px;">
+    <div><h4>Objective Comparison</h4><div id="resCompareObjBars" class="compare-bars"></div></div>
+    <div><h4>Runtime Comparison</h4><div id="resCompareTimeBars" class="compare-bars"></div></div>
+  </div>
+</article>
+</section>
+<section id="scaling" class="panel">
+<div class="section-title">
+  <div>
+    <h2>Scaling &amp; IBM Hardware</h2>
+    <p>Empirical QAOA resource scaling: Qiskit Aer simulation vs. IBM Quantum Heavy-Hex hardware transpilation.</p>
+  </div>
+  <span class="tag">Quantum Hardware Benchmark</span>
+</div>
+
+<div class="warning-banner" style="margin-bottom:18px;">
+  <b>Demonstration &amp; Experimental Dataset — IBM Hardware Measurements</b>
+  Current IBM metrics represent target transpilation on 127-qubit Heavy-Hex topology with precomputed experimental executions. Physical execution results fallback gracefully to precomputed benchmarks.
+</div>
+
+<!-- SECTION A: SCALING ANALYSIS -->
+<article class="card">
+  <div class="section-title">
+    <div>
+      <h3>A. Scaling Analysis</h3>
+      <p class="muted">Structural resource growth across problem sizes comparing ideal simulation against native Heavy-Hex hardware mapping.</p>
+    </div>
+    <span class="tag">2 × 2 Scaling Curves</span>
+  </div>
+
+  <div class="grid two" style="margin-top:14px;">
+    <!-- Graph 1: Logical Qubits vs Binary Variables -->
+    <div class="custom-section">
+      <h4 style="margin:0 0 4px;">1. Logical Qubits vs Binary Variables</h4>
+      <p class="muted" style="font-size:12px;margin:0 10px 10px 0;">QUBO decision variables vs Logical Qubits (N<sub>qubits</sub> = N<sub>binary</sub>)</p>
+      <div id="graphScalingSize" style="min-height:210px;"></div>
+      <div class="legend" style="margin-top:6px;justify-content:center;"><i class="actual bar-aer" style="background:#1192e8!important;"></i> Logical Qubits (N)</div>
+    </div>
+
+    <!-- Graph 2: QAOA Circuit Depth vs Binary Variables -->
+    <div class="custom-section">
+      <h4 style="margin:0 0 4px;">2. QAOA Circuit Depth vs Binary Variables</h4>
+      <p class="muted" style="font-size:12px;margin:0 10px 10px 0;">Depth scaling: Aer Algorithmic vs IBM Heavy-Hex Transpiled (p=1)</p>
+      <div id="graphScalingDepth" style="min-height:210px;"></div>
+      <div class="legend" style="margin-top:6px;justify-content:center;"><i class="actual bar-aer" style="background:#1192e8!important;"></i> Aer Algorithmic Depth <i class="actual bar-ibm" style="background:#7b1fa2!important;"></i> IBM Transpiled Depth</div>
+    </div>
+
+    <!-- Graph 3: QAOA Gate Count vs Binary Variables -->
+    <div class="custom-section">
+      <h4 style="margin:0 0 4px;">3. QAOA Gate Count vs Binary Variables</h4>
+      <p class="muted" style="font-size:12px;margin:0 10px 10px 0;">Total gate count: G = N + p(M<sub>1Q</sub> + M<sub>2Q</sub> + N) vs Heavy-Hex Transpiled</p>
+      <div id="graphScalingGates" style="min-height:210px;"></div>
+      <div class="legend" style="margin-top:6px;justify-content:center;"><i class="actual bar-aer" style="background:#1192e8!important;"></i> Aer Total Gates <i class="actual bar-ibm" style="background:#7b1fa2!important;"></i> IBM Transpiled Gates</div>
+    </div>
+
+    <!-- Graph 4: 2-Qubit Gate Count vs Binary Variables -->
+    <div class="custom-section">
+      <h4 style="margin:0 0 4px;">4. 2-Qubit Gate Count vs Binary Variables</h4>
+      <p class="muted" style="font-size:12px;margin:0 10px 10px 0;">Entangling gates: G<sub>2Q</sub> = p M<sub>2Q</sub> (Rzz) vs IBM Transpiled CX</p>
+      <div id="graphScaling2Q" style="min-height:210px;"></div>
+      <div class="legend" style="margin-top:6px;justify-content:center;"><i class="actual bar-aer" style="background:#1192e8!important;"></i> Aer 2-Qubit (Rzz) <i class="actual bar-ibm" style="background:#7b1fa2!important;"></i> IBM Transpiled CX</div>
+    </div>
+  </div>
+</article>
+
+<!-- SECTION B: IBM QUANTUM HARDWARE DEMONSTRATION -->
+<article class="card" style="margin-top:18px;">
+  <div class="section-title">
+    <div>
+      <h3>B. IBM Quantum Hardware Demonstration</h3>
+      <p class="muted">Dedicated execution of validated instances on IBM Quantum hardware architecture.</p>
+    </div>
+    <span id="ibmSourceTag" class="tag tag-warn">PRECOMPUTED IBM HARDWARE RESULT</span>
+  </div>
+
+  <!-- Dedicated Demo Warning Banner -->
+  <div id="ibmDemoNotice" class="card warning" style="display:none;margin-bottom:14px;padding:12px 16px;background:rgba(241,194,27,0.12);border-left:4px solid #f1c21b;border-radius:4px;">
+    <b style="color:#b28600;font-size:14px;">[ DEMO ]</b><br>
+    <span style="font-size:13px;color:var(--text, #333);">Live IBM Quantum hardware execution is currently supported strictly for:</span>
+    <ul style="margin:4px 0 0 18px;font-size:13px;padding:0;">
+      <li>• <b>Problem A:</b> 2 EV × 2 Stations × 2 Slots (<code>instance-a-2x2x2</code>, 10 Qubits)</li>
+      <li>• <b>Problem B:</b> 3 EV × 2 Stations × 4 Slots (<code>custom-1791428968536</code>, 20 Qubits)</li>
+    </ul>
+    <div style="font-size:12px;color:var(--muted, #666);margin-top:4px;">Displaying precomputed demonstration result for this problem.</div>
+  </div>
+
+  <!-- Hardware Execution Failure Banner -->
+  <div id="ibmHardwareError" class="card danger" style="display:none;margin-bottom:14px;padding:12px 16px;background:rgba(218,30,40,0.1);border-left:4px solid #da1e28;border-radius:4px;">
+    <b style="color:#da1e28;font-size:14px;">HARDWARE EXECUTION FAILED</b><br>
+    <div id="ibmHardwareErrorMsg" style="font-size:13px;margin-top:4px;color:var(--text, #333);"></div>
+  </div>
+
+  <!-- B1 & B2: Problem Selector, Parameters & Run Action -->
+  <div class="controls" style="grid-template-columns:minmax(240px,2fr) minmax(110px,1fr) minmax(110px,1fr) auto;align-items:end;margin-bottom:14px;gap:10px;">
+    <label>Select Problem Instance
+      <select id="ibmProblemSelect" style="font-weight:600;padding:6px 10px;">
+        <option value="instance-a-2x2x2">Problem A — 2 EV × 2 Stations × 2 Slots (10 Qubits) [Supported Live]</option>
+        <option value="custom-1791428968536">Problem B — 3 EV × 2 Stations × 4 Slots (20 Qubits) [Supported Live]</option>
+        <option value="demo-inst-2">Problem 2 — 3 EV × 2 Stations × 3 Slots (14 Qubits) [Demo]</option>
+        <option value="demo-inst-3" selected>Problem 3 — 3 EV × 2 Stations × 4 Slots (Baseline - 22 Qubits) [Demo]</option>
+        <option value="demo-inst-4">Problem 4 — 4 EV × 2 Stations × 4 Slots (30 Qubits) [Demo]</option>
+        <option value="demo-inst-5">Problem 5 — 4 EV × 3 Stations × 4 Slots (45 Qubits) [Demo]</option>
+        <option value="demo-inst-6">Problem 6 — 5 EV × 3 Stations × 4 Slots (54 Qubits) [Demo]</option>
+      </select>
+    </label>
+    <label>QAOA Depth (p)
+      <select id="ibmPSelect" style="font-weight:600;padding:6px 10px;">
+        <option value="1">p = 1</option>
+        <option value="2" selected>p = 2</option>
+        <option value="3">p = 3</option>
+        <option value="4">p = 4</option>
+      </select>
+    </label>
+    <label>Shots
+      <select id="ibmShotsSelect" style="font-weight:600;padding:6px 10px;">
+        <option value="512">512</option>
+        <option value="1024">1024</option>
+        <option value="2048" selected>2048</option>
+        <option value="4096">4096</option>
+        <option value="8192">8192</option>
+      </select>
+    </label>
+    <button id="runIbmHardwareBtn" type="button" class="run" style="white-space:nowrap;padding:7px 18px;">Run on IBM Quantum</button>
+  </div>
+
+  <!-- Metadata Summary Card (Removed Job ID) -->
+  <div id="ibmProblemMetaCard" class="quantum-resource-grid" style="margin:0 0 16px 0;">
+    <div><b id="ibmMetaDims">3 EV × 2 St × 4 T</b><span>Dimensions (E × S × T)</span></div>
+    <div><b id="ibmMetaQubits">22</b><span>Active Logical Qubits</span></div>
+    <div><b id="ibmMetaBackend">IBM Brisbane</b><span>Target Backend</span></div>
+    <div><b id="ibmMetaShots">2048 (p=2)</b><span>Hardware Shots</span></div>
+    <div><b id="ibmMetaDepth">—</b><span>Transpiled Depth</span></div>
+    <div><b id="ibmMeta2QGates">—</b><span>2Q / CX Gates</span></div>
+    <div><b id="ibmMetaBestFeasible">—</b><span>Best Feasible Obj</span></div>
+    <div><b id="ibmMetaFeasibleProb">—</b><span>Feasible Probability</span></div>
+  </div>
+
+  <!-- B3: Side-by-Side Comparison: Qiskit Aer Simulator vs IBM Quantum Hardware -->
+  <div class="grid two" style="margin-top:18px;gap:20px;align-items:start;">
+    
+    <!-- LEFT COLUMN: Qiskit Aer Simulator -->
+    <div class="custom-section" style="border:1px solid #1192e8;background:#fbfdff;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:rgba(17,146,232,0.1);border-left:4px solid #1192e8;border-radius:4px;margin-bottom:12px;">
+        <div>
+          <h4 style="margin:0;color:#1192e8;">Qiskit Aer Simulator</h4>
+          <span style="font-size:12px;color:var(--muted,#666);">Algorithmic QAOA Simulation (Ideal Statevector)</span>
+        </div>
+        <span id="aerFeasibilityBadge" class="badge badge-success">✓ Feasible</span>
+      </div>
+
+      <!-- Aer Simulation Limit Notice (Shown if unsupported size) -->
+      <div id="aerUnsupportedNotice" class="card warning" style="display:none;padding:14px;background:rgba(241,194,27,0.12);border-left:4px solid #f1c21b;border-radius:4px;margin-bottom:12px;">
+        <b style="color:#b28600;font-size:13px;">Out of Simulation Resources</b><br>
+        <span id="aerUnsupportedMsg" style="font-size:12px;color:var(--text,#333);margin-top:4px;display:block;">
+          This problem produces <b id="aerUnsupportedQubits">30</b> logical qubits, which exceeds classical Qiskit Aer simulation limits (&le; 24 logical qubits).
+          Classical statevector simulation is out of resources. Only quantum hardware execution is available.
+        </span>
+      </div>
+
+      <div id="aerResultsContent">
+        <!-- 1. Station Placement & Constraints -->
+        <div style="margin-bottom:14px;">
+          <h5 style="margin:0 0 8px;font-size:13px;color:#29435a;">Station Placement &amp; Constraints</h5>
+          <div id="aerStationsList" style="margin-bottom:8px;"></div>
+          <div id="aerValidationBox" class="checks"></div>
+          <div id="aerViolationsBox" class="solver-violations" style="display:none;margin-top:8px;"></div>
+        </div>
+
+        <!-- 2. EV Charging Schedule -->
+        <div style="margin-bottom:14px;">
+          <h5 style="margin:0 0 8px;font-size:13px;color:#29435a;">EV Charging Schedule</h5>
+          <div id="aerSchedule"></div>
+        </div>
+
+        <!-- 3. Grid Performance -->
+        <div style="margin-bottom:14px;">
+          <h5 style="margin:0 0 6px;font-size:13px;color:#29435a;">Grid Performance</h5>
+          <div id="aerLoadChart" class="chart" style="min-height:130px;"></div>
+          <div class="legend" style="margin-top:6px;"><i class="actual bar-aer"></i> Aer Load <i class="capacity"></i> Capacity</div>
+          <div id="aerGridMetrics" class="quantum-resource-grid" style="margin-top:8px;"></div>
+          <div id="aerGridProfileTable" style="margin-top:10px;"></div>
+        </div>
+
+        <!-- 4. Cost Breakdown -->
+        <div>
+          <h5 style="margin:0 0 6px;font-size:13px;color:#29435a;">Cost Breakdown</h5>
+          <div id="aerCostChart" class="costs"></div>
+          <p id="aerCostSummary" style="margin:8px 0 0;font-size:13px;"><b>Total Objective: —</b></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT COLUMN: IBM Quantum Hardware -->
+    <div class="custom-section" style="border:1px solid #7b1fa2;background:#fdfaff;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:rgba(123,31,162,0.1);border-left:4px solid #7b1fa2;border-radius:4px;margin-bottom:12px;">
+        <div>
+          <h4 style="margin:0;color:#7b1fa2;">IBM Quantum Hardware</h4>
+          <span id="ibmHardwareSubLabel" style="font-size:12px;color:var(--muted,#666);">Real Hardware Execution (ibm_fez)</span>
+        </div>
+        <span id="ibmFeasibilityBadge" class="badge badge-success">✓ Feasible</span>
+      </div>
+
+      <div id="ibmResultsContent">
+        <!-- 1. Station Placement & Constraints -->
+        <div style="margin-bottom:14px;">
+          <h5 style="margin:0 0 8px;font-size:13px;color:#29435a;">Station Placement &amp; Constraints</h5>
+          <div id="ibmStationsList" style="margin-bottom:8px;"></div>
+          <div id="ibmValidationBox" class="checks"></div>
+          <div id="ibmViolationsBox" class="solver-violations" style="display:none;margin-top:8px;"></div>
+        </div>
+
+        <!-- 2. EV Charging Schedule -->
+        <div style="margin-bottom:14px;">
+          <h5 style="margin:0 0 8px;font-size:13px;color:#29435a;">EV Charging Schedule</h5>
+          <div id="ibmSchedule"></div>
+        </div>
+
+        <!-- 3. Grid Performance -->
+        <div style="margin-bottom:14px;">
+          <h5 style="margin:0 0 6px;font-size:13px;color:#29435a;">Grid Performance</h5>
+          <div id="ibmLoadChart" class="chart" style="min-height:130px;"></div>
+          <div class="legend" style="margin-top:6px;"><i class="actual bar-ibm"></i> IBM Load <i class="capacity"></i> Capacity</div>
+          <div id="ibmGridMetrics" class="quantum-resource-grid" style="margin-top:8px;"></div>
+          <div id="ibmGridProfileTable" style="margin-top:10px;"></div>
+        </div>
+
+        <!-- 4. Cost Breakdown -->
+        <div>
+          <h5 style="margin:0 0 6px;font-size:13px;color:#29435a;">Cost Breakdown</h5>
+          <div id="ibmCostChart" class="costs"></div>
+          <p id="ibmCostSummary" style="margin:8px 0 0;font-size:13px;"><b>Total Objective: —</b></p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- B6: Quantum Resource Comparison (SPECIFIC TO SELECTED PROBLEM) -->
+  <div class="custom-section" style="margin-top:18px;">
+    <div class="section-title" style="margin-bottom:10px;">
+      <div>
+        <h4 style="margin:0;">Quantum Resource Comparison (Selected Problem)</h4>
+        <p class="muted" style="font-size:12px;margin:0;">Direct comparison of algorithmic Qiskit Aer simulation vs. transpiled Heavy-Hex circuit metrics for the active problem.</p>
+      </div>
+      <span class="badge badge-info" id="ibmDeviceCapacityBadge">Target Device: 127 Physical Qubits</span>
+    </div>
+
+    <div class="grid two" style="margin-top:12px;">
+      <!-- Graph 1: Logical Qubits vs Physical Qubits Required -->
+      <div style="background:#fff;border:1px solid var(--line);border-radius:5px;padding:12px;">
+        <h5 style="margin:0 0 4px;font-size:13px;color:#29435a;">1. Logical vs Physical Required Qubits</h5>
+        <p class="muted" style="font-size:11px;margin:0 0 8px;">Active decision variables vs mapped physical qubits on heavy-hex chip.</p>
+        <div id="resBarQubits" class="compare-bars" style="min-height:90px;"></div>
+        <small class="muted" style="font-size:10.5px;display:block;margin-top:4px;">*Device capacity is 127 qubits. Physical required represents active mapped qubits.</small>
+      </div>
+
+      <!-- Graph 2: Total Gates: Aer vs IBM -->
+      <div style="background:#fff;border:1px solid var(--line);border-radius:5px;padding:12px;">
+        <h5 style="margin:0 0 4px;font-size:13px;color:#29435a;">2. Total Gate Count: Aer vs IBM</h5>
+        <p class="muted" style="font-size:11px;margin:0 0 8px;">Algorithmic circuit gates vs native transpiled basis gates.</p>
+        <div id="resBarGates" class="compare-bars" style="min-height:90px;"></div>
+      </div>
+
+      <!-- Graph 3: 2-Qubit Gates: Aer vs IBM -->
+      <div style="background:#fff;border:1px solid var(--line);border-radius:5px;padding:12px;">
+        <h5 style="margin:0 0 4px;font-size:13px;color:#29435a;">3. 2-Qubit Entangling Gates: Aer vs IBM</h5>
+        <p class="muted" style="font-size:11px;margin:0 0 8px;">Algorithmic Rzz terms vs physical heavy-hex CX gates.</p>
+        <div id="resBar2Q" class="compare-bars" style="min-height:90px;"></div>
+      </div>
+
+      <!-- Graph 4: Circuit Depth: Aer vs IBM -->
+      <div style="background:#fff;border:1px solid var(--line);border-radius:5px;padding:12px;">
+        <h5 style="margin:0 0 4px;font-size:13px;color:#29435a;">4. Circuit Depth: Aer vs IBM</h5>
+        <p class="muted" style="font-size:11px;margin:0 0 8px;">Algorithmic critical path depth vs transpiled Heavy-Hex depth.</p>
+        <div id="resBarDepth" class="compare-bars" style="min-height:90px;"></div>
+      </div>
+    </div>
+  </div>
+</article>
+</section>
+
+<section id="estimate" class="panel">
+<div class="section-title">
+  <div>
+    <h2>Estimate Quantum Resources</h2>
+    <p>Synthesizes the exact binary QUBO and QAOA circuit to estimate simulation and hardware resource requirements without solving.</p>
+  </div>
+  <span class="tag">Interactive Estimator</span>
+</div>
+
+<article class="card">
+  <div class="section-title">
+    <div>
+      <h3>Problem Definition &amp; Target Hardware</h3>
+      <p class="muted">Configure problem dimensions (supports large instances exceeding live solver caps) and target backend.</p>
+    </div>
+    <div class="actions">
+      <label style="font-size:12px;margin-right:8px;">Preset: 
+        <select id="estimatePreset" style="padding:4px 8px;font-size:12px;">
+          <option value="custom">Custom Definition</option>
+          <option value="baseline">Baseline (3 EV × 2 St × 4 Slots)</option>
+          <option value="small">Small (2 EV × 2 St × 2 Slots)</option>
+          <option value="medium">Medium (4 EV × 2 St × 4 Slots)</option>
+          <option value="large">Large (20 EV × 10 St × 8 Slots)</option>
+        </select>
+      </label>
+    </div>
+  </div>
+
+  <div class="controls" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));">
+    <label>EVs <input id="estEVs" type="number" min="1" max="100" value="3"></label>
+    <label>Stations <input id="estStations" type="number" min="1" max="50" value="2"></label>
+    <label>Time slots <input id="estSlots" type="number" min="1" max="50" value="4"></label>
+    <label>QAOA Depth (p) 
+      <select id="estP">
+        <option value="1">p = 1 (Standard)</option>
+        <option value="2">p = 2</option>
+        <option value="3">p = 3</option>
+      </select>
+    </label>
+    <label>Target IBM Quantum Device
+      <select id="estBackend">
+        <option value="ibm_brisbane">IBM Brisbane — 127 qubits (Eagle r3)</option>
+        <option value="ibm_kyoto">IBM Kyoto — 127 qubits (Eagle r3)</option>
+        <option value="ibm_sherbrooke">IBM Sherbrooke — 127 qubits (Eagle r3)</option>
+        <option value="ibm_torino">IBM Torino — 133 qubits (Heron)</option>
+      </select>
+    </label>
+    <button id="runEstimateBtn" type="button" class="run" style="margin-top:auto;">Estimate Resources</button>
+  </div>
+  <div id="estStatusNotice" style="margin-top:12px;"></div>
+</article>
+
+<div id="estimateResultsContainer" style="display:none;margin-top:18px;">
+  <!-- TOP CONCISE SUMMARY -->
+  <article class="card" id="estSummaryCard">
+    <div class="section-title">
+      <div>
+        <h3>Quantum Resource Summary</h3>
+        <p class="muted" id="estSummaryDesc">Problem Formulation &amp; Global Decision Scale</p>
+      </div>
+      <span class="tag" id="estSummaryTag">Scale Overview</span>
+    </div>
+    <div class="quantum-resource-grid" id="estSummaryGrid">
+      <div><b id="sumQuboVars">-</b><span>QUBO Variables (N)</span></div>
+      <div><b id="sumLogicalQubits">-</b><span>Logical Qubits</span></div>
+      <div><b id="sumQaoaDepth">-</b><span>QAOA Depth (p)</span></div>
+      <div><b id="sumHamTerms">-</b><span>Ising Pauli Terms</span></div>
+      <div><b id="sumTargetDevice">-</b><span>Target Device</span></div>
+    </div>
+  </article>
+
+  <!-- SIDE-BY-SIDE COMPARABLE CARDS -->
+  <div class="grid two" style="margin-top:18px;">
+    <!-- AER / IDEAL SIMULATION -->
+    <article class="card">
+      <div class="section-title">
+        <div>
+          <h3>Aer / Ideal Simulation</h3>
+          <p class="muted">Classical simulation resources assuming ideal all-to-all qubit coupling.</p>
+        </div>
+        <span class="tag live" id="estAerTag">Classical Simulation</span>
+      </div>
+
+      <h4 style="margin:8px 0 6px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Algorithmic QAOA Circuit Resources</h4>
+      <div class="quantum-resource-grid" id="estAerGrid"></div>
+
+      <div class="custom-section" style="margin-top:16px;background:#f8fafc;padding:14px;border:1px solid var(--line);border-radius:6px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <h4 style="margin:0;font-size:13.5px;color:#29435a;">Aer Statevector Computer Requirement</h4>
+          <span id="aerSimStatusBadge" class="badge badge-success">✓ Practical</span>
+        </div>
+        <div class="quantum-resource-grid" id="estAerMemGrid" style="margin:0 0 10px 0;background:transparent;padding:0;border:none;"></div>
+        <div id="estAerNote" style="margin:6px 0 4px;font-size:12px;"></div>
+        <small class="muted" style="display:block;font-size:11px;line-height:1.4;margin-top:6px;">
+          Estimated memory required for the raw double-precision complex statevector (16 bytes per amplitude). Actual system RAM requirements may be higher due to simulator/runtime overhead.
+        </small>
+      </div>
+    </article>
+
+    <!-- IBM QUANTUM DEVICE -->
+    <article class="card">
+      <div class="section-title">
+        <div>
+          <h3>IBM Quantum Device</h3>
+          <p class="muted" id="estIbmSubhead">Transpilation-derived resources mapped to target heavy-hex layout.</p>
+        </div>
+        <span class="tag" id="estIbmTag">Target Transpilation</span>
+      </div>
+
+      <h4 style="margin:8px 0 6px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Transpiled Hardware Circuit Resources</h4>
+      <div class="quantum-resource-grid" id="estIbmGrid"></div>
+
+      <div class="custom-section" style="margin-top:16px;background:#f8fafc;padding:14px;border:1px solid var(--line);border-radius:6px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <h4 style="margin:0;font-size:13.5px;color:#29435a;">Device Capacity &amp; Topology Mapping</h4>
+          <span id="ibmCompatBadge" class="badge badge-success">✓ Fits</span>
+        </div>
+        <div class="quantum-resource-grid" id="estIbmDeviceGrid" style="margin:0 0 10px 0;background:transparent;padding:0;border:none;"></div>
+        <div id="estIbmNote" style="margin:6px 0 4px;font-size:12px;"></div>
+        <small class="muted" style="display:block;font-size:11px;line-height:1.4;margin-top:6px;">
+          The QAOA circuit is transpiled for this target Heavy-Hex topology. Physical execution results are pending future IBM Quantum hardware experiments.
+        </small>
+      </div>
+    </article>
+  </div>
+</div>
+</section>
+</main><div id="toast"></div><script src="app.js?v=3"></script></body></html>
