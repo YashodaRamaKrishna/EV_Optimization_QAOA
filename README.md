@@ -420,7 +420,3 @@ Comprehensive architecture, mathematical specifications, and progress logs are l
 - [`docs/PROJECT_PROGRESS.md`](docs/PROJECT_PROGRESS.md): Milestone logs and acceptance test results.
 
 ---
-
-## License
-
-This project is a research prototype. If releasing publicly, add an appropriate open-source license (such as MIT or Apache 2.0).
